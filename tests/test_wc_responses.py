@@ -85,6 +85,65 @@ class ResponsesSourceTest(unittest.TestCase):
                 wire = responses.wire_rows([row], "https://" + host + "/v1")
                 self.assertEqual("id" in wire[0], expected)
 
+    def test_gpt62_developer_lead_carries_the_system_prompt(self):
+        rows, reply = [user("question")], assistant("answer")
+        developer = {"type": "message", "role": "developer",
+                     "content": [{"type": "input_text", "text": "Synthetic system text."}]}
+        saved = capture(rows, reply, route=CODEX)
+        saved["body"].pop("instructions")
+        saved["body"]["input"] = [developer, *saved["body"]["input"]]
+        self.assertEqual(responses.developer_lead(saved["body"]["input"]), 1)
+        responses.check_source(saved["body"], rows, CODEX[1])
+        built = responses.build_request(saved, [*rows, reply], CODEX, 100_000, INSTRUCTION)
+        self.assertEqual(built["input"][0], developer)
+        self.assertNotIn("instructions", built)
+
+    def test_a_developer_item_off_the_first_place_is_refused(self):
+        rows = [user("question")]
+        developer = {"type": "message", "role": "developer",
+                     "content": [{"type": "input_text", "text": "Synthetic system text."}]}
+        wire = responses.wire_rows(rows, CODEX[1], model=CODEX[0])
+        self.assertEqual(responses.developer_lead([*wire, developer]), 0)
+        self.assertEqual(responses.developer_lead([wire[0], developer]), 0)
+        body = {"model": CODEX[0], "store": False, "input": [developer, developer, *wire]}
+        with self.assertRaises(WarmRefusal):
+            responses.check_source(body, rows, CODEX[1])
+
+    def test_a_malformed_developer_item_is_refused(self):
+        rows = [user("question")]
+        wire = responses.wire_rows(rows, CODEX[1], model=CODEX[0])
+        cases = [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": " "}]},
+            {"type": "message", "role": "developer",
+             "content": [{"type": "input_text", "text": "a"}, {"type": "input_text", "text": "b"}]},
+            {"type": "message", "role": "developer", "content": [{"type": "output_text", "text": "a"}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "a"}],
+             "id": "msg_fake"},
+        ]
+        for developer in cases:
+            body = {"model": CODEX[0], "store": False, "input": [developer, *wire]}
+            with self.subTest(developer=developer), self.assertRaises(WarmRefusal) as caught:
+                responses.check_source(body, rows, CODEX[1])
+            self.assertEqual(caught.exception.code, "source_transform_unsupported")
+
+    def test_an_empty_instructions_field_still_refuses_with_a_developer_lead(self):
+        rows = [user("question")]
+        developer = {"type": "message", "role": "developer",
+                     "content": [{"type": "input_text", "text": "Synthetic system text."}]}
+        wire = responses.wire_rows(rows, CODEX[1], model=CODEX[0])
+        for instructions in ("", " padded "):
+            body = {"model": CODEX[0], "store": False, "instructions": instructions,
+                    "input": [developer, *wire]}
+            with self.subTest(instructions=instructions), self.assertRaises(WarmRefusal):
+                responses.check_source(body, rows, CODEX[1])
+        body = {"model": CODEX[0], "store": False, "instructions": "Synthetic system text.",
+                "input": [developer, *wire]}
+        responses.check_source(body, rows, CODEX[1])
+        # Hermes omits the field. A null value is not that form.
+        body = {"model": CODEX[0], "store": False, "instructions": None, "input": [developer, *wire]}
+        with self.assertRaises(WarmRefusal):
+            responses.check_source(body, rows, CODEX[1])
+
     def test_source_change_is_refused(self):
         rows = [user("original")]
         body = {"model": ROUTE[0], "instructions": "Synthetic system text.", "store": False,

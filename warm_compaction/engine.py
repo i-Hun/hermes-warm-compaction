@@ -11,7 +11,7 @@ from collections.abc import Callable
 
 from agent.context_engine import ContextEngine
 
-from . import fallback, handoff, layout, ledger, native, protocol, warm
+from . import fallback, handoff, layout, ledger, native, protocol, responses, warm
 from .capture import CaptureStore, key_stamp
 from .rows import SendPolicy, api_content, attr, estimate_tokens, hermes_value, sent_rows, sent_tokens
 
@@ -157,6 +157,15 @@ def request_overhead(capture: dict[str, Any] | None, messages: list | None = Non
         # Native routes keep system text outside history. Count all other structured controls too.
         controls = {key: value for key, value in body.items() if key != field
                     and isinstance(value, (str, dict, list))}
+        if mode == "codex_responses":
+            # GPT-6.2+ moves the system prompt into a leading developer input item. It comes again with the
+            # next request, so it is overhead too, not history.
+            try:
+                lead = responses.developer_lead(body[field])
+            except warm.WarmRefusal:
+                return None
+            if lead:
+                controls[field] = body[field][:lead]
         return estimate_tokens(controls)
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         return None

@@ -29,6 +29,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Fixed
 
+- Accept the leading `developer` input item that Hermes sends for GPT-6.2+ models on `codex_responses` routes instead of the top-level `instructions` field (Hermes a41b998c31). Before, the source check refused every such request, so each compaction fell back to the full-price summary. Accept only that exact shape in the first position, and count it in the request overhead.
 - Report safe fallback reply metadata after success, including success after a retry. Keep the final reply counts, requested limit, attempt count, and end-marker status in the engine log and status. Do not report summary text or the random marker. The requested limit does not prove that the host sent it or that the server applied it.
 - Require at least one verified source-content quote after fallback construction. Use the existing one retry for all-unknown or generated-label-only output, then preserve history if the second reply is also unusable. Keep actual text and argument provenance separate from generated labels. Give a recognized earlier summary core the existing share before its copied appendix uses any remainder; preserve the legacy whole-summary bound for unknown formats.
 - Use the exact bounded focus and memory block sent to the fallback as a separate source block. Keep the existing request reserve and reject an encoded prior quote that also occurs inside an ordinary source line.

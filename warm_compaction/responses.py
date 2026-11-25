@@ -45,6 +45,32 @@ def is_codex_backend(base_url: Any) -> bool:
     return parsed.hostname == "chatgpt.com" and parsed.path.startswith("/backend-api/codex")
 
 
+def developer_lead(items: Any, base_url: Any = None) -> int:
+    """Return 1 when the input starts with the developer message that Hermes sends for GPT-6.2+.
+
+    Starting with GPT-6.2 the host moves the system prompt out of the top-level ``instructions`` field into a
+    leading ``developer`` input item, so that the prompt stays cacheable
+    (agent/codex_responses_adapter._prepend_developer_instructions). Only that exact shape is accepted: one
+    role message with a single nonblank input_text block and no other fields.
+    """
+    if not isinstance(items, list) or not items:
+        return 0
+    item = items[0]
+    if not isinstance(item, dict) or item.get("role") != "developer" or item.get("type") not in (None, "message"):
+        return 0
+    if set(item) - {"type", "role", "content"}:
+        raise WarmRefusal("source_transform_unsupported")
+    content = item.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        raise WarmRefusal("source_transform_unsupported")
+    part = content[0]
+    if (not isinstance(part, dict) or set(part) != {"type", "text"} or part.get("type") != "input_text"
+            or not isinstance(part.get("text"), str) or not part["text"].strip()):
+        raise WarmRefusal("source_transform_unsupported")
+    _safe_text(part["text"], base_url)
+    return 1
+
+
 def _text(content: Any) -> str:
     if content is None:
         return ""
@@ -256,26 +282,33 @@ def check_source(body: dict[str, Any], history: list, base_url: Any = None, nati
     check_settings(body, base_url)
     want = wire_rows(history, base_url, model=body.get("model"))
     got = body.get("input")
+    # GPT-6.2+: the system prompt travels as a leading developer item; it has no stored row.
+    lead = developer_lead(got, base_url)
     # The Responses API treats an input item that has a role and no "type" as a message.
     # Hermes omits that default, so normalise it before the comparison.
     if isinstance(got, list):
         got = [({**item, "type": "message"} if isinstance(item, dict) and "type" not in item and "role" in item
-                else item) for item in got]
+                else item) for item in got[lead:]]
     if got != want:
         raise WarmRefusal("source_transform_unsupported")
 
 
 def check_settings(body: dict[str, Any], base_url: Any = None) -> None:
     """Refuse stateful and forced-output request settings."""
+    lead = developer_lead(body.get("input"), base_url)
     if (set(body) - _SETTINGS or not isinstance(body.get("input"), list)
             or any(value is None for value in body.values())):
         raise WarmRefusal("settings_unsupported")
     # The main terminal runs preflight again after middleware. Accept only unchanged scalar forms.
     for field in ("model", "instructions"):
         value = body.get(field)
+        if field == "instructions" and field not in body and lead:
+            # GPT-6.2+ sends the system prompt as the leading developer item and omits this field.
+            continue
         if not isinstance(value, str) or not value or value != value.strip():
             raise WarmRefusal("source_transform_unsupported")
-    _safe_text(body["instructions"], base_url)
+    if isinstance(body.get("instructions"), str):
+        _safe_text(body["instructions"], base_url)
     for field, kind in (("reasoning", dict), ("include", list)):
         if field in body and not isinstance(body[field], kind):
             raise WarmRefusal("source_transform_unsupported")

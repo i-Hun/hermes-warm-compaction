@@ -1595,6 +1595,23 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(request_overhead(capture, rows), base + estimate_tokens(added) - estimate_tokens("hi"))
         self.assertEqual(request_overhead(capture), base)
 
+    def test_request_overhead_counts_a_gpt62_developer_lead(self):
+        # GPT-6.2+ sends the system prompt as a leading developer input item. It comes again with the next
+        # request like the instructions field, so the budget must count it.
+        from warm_compaction import responses
+        from warm_compaction.engine import request_overhead
+        route = ("fake-model", "https://chatgpt.com/backend-api/codex", "codex_responses")
+        rows, system = [user("question")], "Synthetic system text. " * 400
+        body = {"model": route[0], "store": False, "instructions": system,
+                "input": responses.wire_rows(rows, route[1], model=route[0])}
+        plain = {"route": route, "body": body}
+        lead = {"route": route, "body": {**{k: v for k, v in body.items() if k != "instructions"}, "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": system}]},
+            *body["input"]]}}
+        with_lead, with_field = request_overhead(lead) or 0, request_overhead(plain) or 0
+        self.assertGreater(with_field, 1000)
+        self.assertGreater(with_lead, with_field // 2)
+
     def test_request_overhead_counts_every_structured_request_field(self):
         # The legacy functions field (and tools, response schemas) comes again with the next ordinary request.
         from warm_compaction.engine import request_overhead
