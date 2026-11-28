@@ -390,6 +390,30 @@ def synthetic_history(pairs=30):
     return rows
 
 
+def seed_transcript(home, session_id, rows):
+    """Write the synthetic session and its rows into the run store.
+
+    A Hermes with the storage interface writes them through one store handle. A Hermes without the
+    package, such as the minimum supported version, writes them through the SessionDB batch verb.
+    """
+    try:
+        from persistence.conversation.messages import NewMessage
+        from persistence.conversation.sessions import NewSession
+        from persistence_assembly import open_persistence, profile_scope
+    except ModuleNotFoundError as exc:
+        # Only a missing persistence package takes the old path. Any other failure must stop the run.
+        if exc.name != "persistence":
+            raise
+        from hermes_state import SessionDB
+        with SessionDB(Path(home) / "state.db") as db:
+            db.create_session(session_id, "cli")
+            db.append_messages_batch(session_id, rows)
+        return
+    with open_persistence(profile_scope(home=Path(home)), eager=True) as store:
+        store.sessions.create(NewSession(session_id=session_id, source="cli"))
+        store.messages.append_batch(session_id, [NewMessage.from_live(dict(row)) for row in rows])
+
+
 def plan_for(scenario):
     if scenario == "manual_reasoning":
         return {"main": [{"content": "The code word is BLUE-7.", "reasoning_content": "Synthetic first thoughts."},
@@ -541,7 +565,12 @@ def run_phase(spec, session_dir):
         # A Hermes process selects its dependency set at start, before any third-party import.
         import hermes_bootstrap  # noqa: F401
         merge_config(home / "config.yaml", {"model": {"base_url": server.base_url},
-                                          "compression": {"progress_notices": False}})
+                                          "compression": {"progress_notices": False},
+                                          # Turn tool search off (see issue 75). If tool search is on,
+                                          # Hermes main turns a call to a deferred tool into a tool_call
+                                          # call with a calls list. The warm path does not accept this
+                                          # form, and this check tests the warm path with a plain tool call.
+                                          "tools": {"tool_search": {"enabled": "off"}}})
         import platform
         # Fill the platform cache before the fence: some Windows Pythons start "cmd /c ver" one time.
         platform.uname()
@@ -557,18 +586,17 @@ def run_phase(spec, session_dir):
                       home / "plugins" / "warm_compaction")
         sys.addaudithook(fence)
 
-        db = SessionDB(home / "state.db")
         # The status lines that Hermes shows the user (CLI print and the gateway status callback).
         statuses = []
         sid = f"wc-{scenario}"
-        db.create_session(sid, "cli")
         initial = synthetic_history()
         if scenario == "manual_reasoning":
             initial[1].update(reasoning="Synthetic earlier thoughts.", reasoning_content="Synthetic earlier thoughts.")
             initial[3]["content"] = "[CONTEXT SUMMARY]: Synthetic earlier summary."
             initial[3]["_compressed_summary"] = True
             initial[5]["display_kind"] = "compaction_notice"
-        db.append_messages_batch(sid, initial)
+        seed_transcript(home, sid, initial)
+        db = SessionDB(home / "state.db")
         agent = AIAgent(base_url=server.base_url, api_key="no-key-required", provider="custom",
                         api_mode="chat_completions", model=MODEL,
                         enabled_toolsets=["wc_test"] if scenario in AUTO_SCENARIOS else [],

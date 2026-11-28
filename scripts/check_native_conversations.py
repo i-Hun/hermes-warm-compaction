@@ -128,7 +128,7 @@ def check_warm_wire(server, checks):
 def worker(source, case, dependency_paths, phase):
     """Run the host loop. Do not call plugin hooks or middleware by hand."""
     sys.path[:0] = [str(source), *map(str, dependency_paths), str(ROOT / "scripts")]
-    from check_plugin_hermes import Fence, merge_config, summary_rows_ok, synthetic_history
+    from check_plugin_hermes import Fence, merge_config, seed_transcript, summary_rows_ok, synthetic_history
     home = Path(os.environ["HERMES_HOME"])
     scenario = home.parent
     installed = home / "plugins" / "warm_compaction"
@@ -186,16 +186,15 @@ def worker(source, case, dependency_paths, phase):
         origin = Path(sys.modules[AIAgent.__module__].__file__).resolve()
         checks["agent_origin_is_pinned_source"] = origin.is_relative_to(source)
         sys.addaudithook(fence)
-        db = SessionDB(home / "state.db")
         if phase == "run":
-            db.create_session(SID, "cli")
             history = synthetic_history(20)
             for row in history:
                 row["content"] = row["content"].strip()
-            db.append_messages_batch(SID, history)
+            seed_transcript(home, SID, history)
             session_id = SID
         else:
             session_id = (scenario / "session-id").read_text(encoding="utf-8")
+        db = SessionDB(home / "state.db")
         agent = AIAgent(base_url=server.base_url, api_key=KEY, provider="custom", api_mode=mode_for(case), model=MODEL,
                         enabled_toolsets=["wc_test"] if case.endswith("_auto_tool") else [], disabled_toolsets=[],
                         quiet_mode=True, skip_context_files=True, skip_memory=True, skip_background_review=True,
