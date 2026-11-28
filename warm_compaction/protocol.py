@@ -25,7 +25,8 @@ def ends_with_instruction(row: Any, instruction: str) -> bool:
             and content[-1].get("type") in ("text", "input_text") and content[-1].get("text") == instruction)
 
 
-def check_source(body: dict, history: list, route: tuple, native_type: str | None = None) -> None:
+def check_source(body: dict, history: list, route: tuple, native_type: str | None = None,
+                 provider: Any = None) -> None:
     """Check that the captured input represents the stored history."""
     from . import anthropic, responses, warm
     if route[2] == "codex_responses":
@@ -33,7 +34,7 @@ def check_source(body: dict, history: list, route: tuple, native_type: str | Non
     elif route[2] == "anthropic_messages":
         anthropic.check_source(body, history, route[1], native_type)
     else:
-        warm.check_source(body, history, route[1], native_type)
+        warm.check_source(body, history, route[1], native_type, provider)
 
 
 def envelope(raw: bytes, api_mode: str) -> dict:

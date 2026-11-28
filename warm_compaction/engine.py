@@ -582,7 +582,7 @@ class WarmCompactionEngine(ContextEngine):
                 raise warm.WarmRefusal("credential_changed")
             instruction = handoff.build_instruction(focus_topic, memory, self._settings["summary_words"])
             body = warm.build_request(capture, messages, attempt[0], self.context_length, instruction,
-                                      warm.native_details_type(attempt[2]))
+                                      warm.native_details_type(attempt[2]), provider=attempt[2])
             if self._cancelled():
                 raise warm.WarmRefusal("cancelled")
             field = protocol.history_key(attempt[0][2])
@@ -765,7 +765,7 @@ class WarmCompactionEngine(ContextEngine):
         try:
             warm.split_history(capture, messages)
             protocol.check_source(body, messages[: len(capture["digests"])], self._wc_route,
-                                  warm.native_details_type(self._wc_provider))
+                                  warm.native_details_type(self._wc_provider), self._wc_provider)
         except Exception:
             return None
         return capture

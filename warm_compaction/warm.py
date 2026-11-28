@@ -192,9 +192,10 @@ def _same_replay_fields(wire: Any, expected: dict[str, Any]) -> bool:
 
 
 def check_source(body: dict[str, Any], history_rows: list, base_url: Any = None,
-                 native_type: str | None = None) -> None:
+                 native_type: str | None = None, provider: Any = None) -> None:
     """Refuse a request whose messages are not system rows followed by the stored rows. A row that a hook or
-    a middleware rewrote would make the handoff summarize text that is not in the history it replaces."""
+    a middleware rewrote would make the handoff summarize text that is not in the history it replaces.
+    provider: the provider name of the route, for the replay route of the host (see wire_row)."""
     sent = body["messages"]
     offset = len(sent) - len(history_rows)
     if offset < 0 or any(attr(row, "role") not in SYSTEM_ROLES for row in sent[:offset]):
@@ -204,7 +205,7 @@ def check_source(body: dict[str, Any], history_rows: list, base_url: Any = None,
     # The replayed fields follow the captured request only: the new rows do not change what Hermes sent.
     echo = needs_reasoning_echo(body, [])
     for wire, row in zip(sent[offset:], history_rows):
-        want = wire_row(row, echo, body.get("model"), base_url, native_type)
+        want = wire_row(row, echo, body.get("model"), base_url, native_type, provider)
         # Hermes d4d2ab7b can send stored reasoning on local Chat Completions routes.
         # Accept this field only when the sent assistant text equals the stored text.
         reasoning = attr(row, "reasoning")
@@ -288,13 +289,31 @@ def _replay_details(details: Any, native_type: str | None = None) -> list | None
     return copy.deepcopy(kept) if kept is not None else None
 
 
+def _core_replay_route(provider: Any, model: Any, base_url: Any) -> Any:
+    """The reasoning replay decision of the host for this chat_completions route, or None when the host has no
+    such decision. Hermes (agent.message_sanitization.reasoning_replay_route) returns a route with two fields:
+    ``pad`` (the must-echo tier) and ``carriers`` (the reasoning keys that the route reads). A route that reads
+    reasoning_content and does not need the echo sends that field only on rows with non-blank reasoning text.
+    The legacy three-argument policy call pads every assistant row instead, and a row without a pad then differs
+    from the sent row. A Hermes version before the route has no such function, and the legacy call is correct
+    there."""
+    if provider is None:
+        return None
+    try:
+        from agent.message_sanitization import reasoning_replay_route
+        return reasoning_replay_route("chat_completions", provider, model, base_url)
+    except Exception:
+        return None
+
+
 def wire_row(row: Any, reasoning_echo: bool = False, model: Any = None, base_url: Any = None,
-             native_type: str | None = None) -> dict[str, Any]:
+             native_type: str | None = None, provider: Any = None) -> dict[str, Any]:
     """Return the wire form of a stored row, as Hermes sends it: only the fields that the API reads, the
     api_content sidecar of a user or assistant row in place of its content, reasoning_content on an assistant
     row when the route needs it, the thought signature (extra_content) of a tool call for a Gemini model, and
     reasoning_details of an assistant row on a route that replays it or for a provider profile with a native
-    carrier type (native_type: that carrier only of the native carriers)."""
+    carrier type (native_type: that carrier only of the native carriers). provider: the provider name of the
+    route; with it, the reasoning policy of the host uses the replay route of the host (pad, carriers)."""
     wire: dict[str, Any] = {"role": attr(row, "role"), "content": copy.deepcopy(api_content(row))}
     for key in ("tool_call_id", "name"):
         value = attr(row, key)
@@ -326,7 +345,11 @@ def wire_row(row: Any, reasoning_echo: bool = False, model: Any = None, base_url
             wire["reasoning_details"] = details
     if isinstance(row, dict):
         policy = hermes_value("agent.message_sanitization", "apply_reasoning_content_policy", _reasoning_policy)
-        policy(row, wire, reasoning_echo)
+        route = _core_replay_route(provider, model, base_url) if policy is not _reasoning_policy else None
+        if route is None:
+            policy(row, wire, reasoning_echo)
+        else:
+            policy(row, wire, route.pad, route.carriers)
     return wire
 
 
@@ -411,9 +434,10 @@ def fits(body: dict[str, Any], context_length: int, measured_tokens: int | None 
 
 
 def build_request(capture: dict[str, Any], messages: list, route: tuple, context_length: int,
-                  instruction: str, native_type: str | None = None) -> dict[str, Any]:
+                  instruction: str, native_type: str | None = None, provider: Any = None) -> dict[str, Any]:
     """Return the warm request body. Raise WarmRefusal when a condition is not true. native_type: the native
-    reasoning carrier type of the provider profile (native_details_type)."""
+    reasoning carrier type of the provider profile (native_details_type). provider: the provider name of the
+    route; the replay route of the host shapes the reasoning fields (see wire_row)."""
     if route[2] == "codex_responses":
         from .responses import build_request as build_native
         return build_native(capture, messages, route, context_length, instruction, native_type)
@@ -429,11 +453,12 @@ def build_request(capture: dict[str, Any], messages: list, route: tuple, context
         raise WarmRefusal(capture.get("refusal") or "settings_unsupported")
     check_settings(body)
     new_rows, trailing = split_history(capture, messages)
-    check_source(body, messages[: len(capture["digests"])], route[1], native_type)
+    check_source(body, messages[: len(capture["digests"])], route[1], native_type, provider)
     request = dict(body)
     # Send the trailing user rows too: the tail can keep only the newest of them, and compaction removes the others.
     echo = needs_reasoning_echo(body, new_rows)
-    added = [wire_row(row, echo, body.get("model"), route[1], native_type) for row in (*new_rows, *trailing)]
+    added = [wire_row(row, echo, body.get("model"), route[1], native_type, provider)
+             for row in (*new_rows, *trailing)]
     request["messages"] = [*body["messages"], *_join_user_rows(added, instruction)]
     request["stream"] = False
     request.pop("stream_options", None)

@@ -2,16 +2,19 @@
 
 import copy
 import json
+import sys
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 from warm_compaction.rows import estimate_tokens
 from warm_compaction.warm import (
-    HANDOFF_MAX_TOKENS, HANDOFF_MIN_TOKENS, SAFETY, WarmRefusal, build_request, check_settings, ends_with_instruction,
-    fits, send, split_history, urllib_post, wire_row,
+    HANDOFF_MAX_TOKENS, HANDOFF_MIN_TOKENS, SAFETY, WarmRefusal, build_request, check_settings, check_source,
+    ends_with_instruction, fits, send, split_history, urllib_post, wire_row,
 )
-from wc_fixtures import ROUTE, assistant, capture_for, tool, user
+from wc_fixtures import ROUTE, SYSTEM, assistant, capture_for, tool, user, wire
 
 INSTRUCTION = "Write the handoff."
 
@@ -129,6 +132,107 @@ class WireRowTest(unittest.TestCase):
         self.assertEqual(wire_row(row), {"role": "tool", "content": "out", "tool_call_id": "c1"})
 
 
+# A host with a replay route decides the reasoning fields by route: a route that reads reasoning_content and
+# does not need the must-echo pad sends that field only on assistant rows with non-blank reasoning text.
+REPLAY_CARRIERS = frozenset({"reasoning_content"})
+
+
+def host_replay_route(api_mode, provider, model, base_url):
+    """The stand-in of agent.message_sanitization.reasoning_replay_route for a route without the echo."""
+    return SimpleNamespace(pad=False, carriers=REPLAY_CARRIERS)
+
+
+def host_reasoning_policy(source, wire, needs_thinking_pad, carriers=None):
+    """The stand-in of agent.message_sanitization.apply_reasoning_content_policy: the route carriers decide the
+    keys, and the must-echo pad applies only where the route needs it."""
+    if source.get("role") != "assistant":
+        return
+    text = next((source[key] for key in ("reasoning_content", "reasoning")
+                 if isinstance(source.get(key), str) and source[key].strip()), None)
+    effective = carriers if carriers is not None else (REPLAY_CARRIERS if needs_thinking_pad else frozenset())
+    if "reasoning_content" in effective and (text is not None or needs_thinking_pad):
+        wire["reasoning_content"] = text if text is not None else " "
+    else:
+        wire.pop("reasoning_content", None)
+
+
+def legacy_reasoning_policy(source, wire, needs_thinking_pad):
+    """The stand-in of the three-argument policy of a host without the replay route."""
+    if source.get("role") != "assistant":
+        return
+    if not needs_thinking_pad:
+        wire.pop("reasoning_content", None)
+        return
+    existing, reasoning = source.get("reasoning_content"), source.get("reasoning")
+    if isinstance(existing, str):
+        wire["reasoning_content"] = existing or " "
+    elif isinstance(reasoning, str) and reasoning and not source.get("tool_calls"):
+        wire["reasoning_content"] = reasoning
+    else:
+        wire["reasoning_content"] = " "
+
+
+class HostReplayRouteTest(unittest.TestCase):
+    """The replay route of the host, not the captured echo flag, shapes the reasoning fields."""
+
+    PROVIDER = "fireworks"
+
+    def install_host(self, *, route=True, policy=host_reasoning_policy):
+        module = ModuleType("agent.message_sanitization")
+        module.apply_reasoning_content_policy = policy
+        if route:
+            module.reasoning_replay_route = host_replay_route
+        patcher = patch.dict(sys.modules, {"agent": ModuleType("agent"),
+                                          "agent.message_sanitization": module})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def host_body(self, rows):
+        """The captured body as this route sends it: the stored rows with the route carriers."""
+        sent = []
+        for row in rows:
+            sent_row = copy.deepcopy(wire([row])[0])
+            host_reasoning_policy(row, sent_row, False, REPLAY_CARRIERS)
+            sent.append(sent_row)
+        return {"model": ROUTE[0], "messages": [copy.deepcopy(SYSTEM), *sent]}
+
+    def test_wire_rows_follow_the_route_carriers(self):
+        self.install_host()
+        with_text = assistant("", [("c1", "read", "{}")], reasoning="synthetic thought")
+        padded = assistant("done", reasoning_content=" ")
+        self.assertEqual(
+            wire_row(with_text, True, ROUTE[0], ROUTE[1], provider=self.PROVIDER)["reasoning_content"],
+            "synthetic thought")
+        self.assertNotIn("reasoning_content",
+                         wire_row(padded, True, ROUTE[0], ROUTE[1], provider=self.PROVIDER))
+
+    def test_the_check_accepts_the_captured_rows_of_this_route(self):
+        self.install_host()
+        rows = [user("q1"), assistant("", [("c1", "read", "{}")], reasoning="synthetic thought"),
+                tool("c1", "synthetic result"), assistant("done", reasoning_content=" "), user("q2")]
+        check_source(self.host_body(rows), rows, ROUTE[1], provider=self.PROVIDER)
+        # Without the provider the plugin cannot know the route, and the legacy pad refuses this body.
+        with self.assertRaises(WarmRefusal):
+            check_source(self.host_body(rows), rows, ROUTE[1])
+
+    def test_the_request_accepts_the_captured_rows_of_this_route(self):
+        self.install_host()
+        rows = [user("q1"), assistant("a1", reasoning_content=" "), user("q2")]
+        reply = assistant("", [("c1", "read", "{}")], reasoning="synthetic thought")
+        capture = capture_for(rows, reply)
+        capture["body"] = self.host_body(rows)
+        body = build_request(capture, [*rows, reply, tool("c1", "r1")], ROUTE, 100_000, INSTRUCTION,
+                             provider=self.PROVIDER)
+        self.assertEqual(body["messages"][-3]["reasoning_content"], "synthetic thought")
+
+    def test_a_host_without_the_route_keeps_the_legacy_pad(self):
+        # Compatibility with the minimum Hermes: a three-argument policy and no route.
+        self.install_host(route=False, policy=legacy_reasoning_policy)
+        row = assistant("done", reasoning_content=" ")
+        self.assertEqual(wire_row(row, True, ROUTE[0], ROUTE[1], provider=self.PROVIDER)["reasoning_content"],
+                         " ")
+
+
 class SettingsTest(unittest.TestCase):
     def test_refuses_settings_that_change_the_reply_form(self):
         for extra in ({"n": 2}, {"tool_choice": "required"}, {"tool_choice": {"type": "function"}},
@@ -205,7 +309,6 @@ class BuildRequestTest(unittest.TestCase):
         # Hermes 45871e10 replays the <provider>.native_assistant carrier that the provider profile declares
         # (native_reasoning_details_type), also on a route that does not replay other reasoning_details.
         from warm_compaction.warm import WarmRefusal, check_source, wire_row
-        from wc_fixtures import SYSTEM, wire
         carrier = [{"type": "acme.native_assistant", "data": "n"}]
         row = assistant("a1", reasoning_details=carrier)
         self.assertNotIn("reasoning_details", wire_row(row, base_url=ROUTE[1]))
