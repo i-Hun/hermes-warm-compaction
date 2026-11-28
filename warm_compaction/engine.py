@@ -39,6 +39,8 @@ CARRIER_TOKENS = 500
 SUMMARY_RESERVE = 2 * fallback.MAX_TOKENS
 # The largest reply reserve for an unknown reply limit: the Hermes output reserve of a native Gemini route.
 UNKNOWN_RESERVE_MAX = 65_536
+# The API modes that replay a signed or encrypted history record: the plugin cannot cut that record.
+NATIVE_MODES = ("codex_responses", "anthropic_messages")
 # After this many compactions in a row without the warm path, the user gets one notice.
 # A host compatibility refusal starts the notice at the first failure.
 WARM_FAILURE_STREAK = 3
@@ -486,7 +488,23 @@ class WarmCompactionEngine(ContextEngine):
             if free is not None:
                 if overhead is None:
                     free //= 2
-                native_overflow = estimate_tokens(sent_rows(new, policy)) > free
+                candidate = estimate_tokens(sent_rows(new, policy))
+                native_overflow = candidate > free
+                window = int(self.context_length or 0)
+                if native_overflow and overhead is not None and window > 0:
+                    # The threshold is a policy, not a hard limit. A candidate above the threshold can still
+                    # fit the window, and the host checks the boundary again on the next request. The window
+                    # less the reply reserve and the overhead is the hard limit: a request above it cannot be
+                    # sent. A refusal here fails the turn that started the compaction, although the history
+                    # fits the window.
+                    if candidate <= window - reserve - overhead:
+                        native_overflow = False
+                        above = overhead + candidate - int(self.threshold_tokens or 0)
+                        if above > 0:
+                            record["over_threshold"] = above
+                            logger.warning(
+                                "Warm compaction keeps %d tokens above the compaction threshold: the compacted "
+                                "request fits the window less the reply reserve", above)
         # A stale worker must not change the counter or replace a newer candidate. No model call holds this lock.
         with self._wc_result_lock:
             if self._cancelled() or self._attempt() != attempt:
@@ -528,7 +546,7 @@ class WarmCompactionEngine(ContextEngine):
         capture = self._budget_capture(self._store.latest(self._wc_session_id), messages)
         body = capture.get("body") if capture else None
         mode = self._wc_route[2]
-        if mode in ("codex_responses", "anthropic_messages"):
+        if mode in NATIVE_MODES:
             return SendPolicy(details=True, signatures=False, echo=False, cut_reasoning=False, native_mode=mode)
         sent = [row for row in (body.get("messages") or []) if isinstance(row, dict) and row.get("role") == "assistant"
                 ] if isinstance(body, dict) else []
@@ -710,9 +728,11 @@ class WarmCompactionEngine(ContextEngine):
 
     def _room(self, tail_rows: list, summary: str, overhead: int = 0, reserve: int = 0,
               policy: SendPolicy = SendPolicy()) -> int | None:
-        """Tokens that stay free below the compaction threshold, and below the context window less the reply
-        reserve, after the request overhead (system rows and tool schemas), the tail rows, the summary, and the
-        summary row headings. None without a threshold."""
+        """Tokens that stay free below the compaction limit after the request overhead (system rows and tool
+        schemas), the tail rows, the summary, and the summary row headings. None without a threshold. The limit
+        is the threshold and the context window less the reply reserve, the lower one. On a native replay route
+        the plugin cannot cut a signed or encrypted record: the threshold there is a policy, and compress
+        commits a candidate above it when the candidate fits the window (see compress)."""
         threshold = int(self.threshold_tokens or 0)
         if threshold <= 0:
             return None

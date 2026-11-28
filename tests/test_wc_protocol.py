@@ -267,7 +267,10 @@ class NativeTailTest(unittest.TestCase):
                 self.assertEqual(engine.compression_count, 0)
                 self.assertEqual((engine.warm_last["path"], engine.warm_last["reason"]), ("aborted", "disabled"))
 
-    def test_native_replay_with_known_overhead_must_fit_below_threshold(self):
+    def test_native_replay_with_known_overhead_above_the_threshold_is_committed(self):
+        # The threshold is a policy, not a hard limit. This replay is above the threshold, but with its
+        # overhead and the reply reserve it stays below the window: the compaction commits the candidate
+        # and records how far above the threshold it is.
         from warm_compaction import anthropic, responses
         for mode in ("codex_responses", "anthropic_messages"):
             with self.subTest(mode=mode):
@@ -285,9 +288,11 @@ class NativeTailTest(unittest.TestCase):
                     total = sent_tokens(rows[-1], engine._policy(rows)) + request_overhead(capture, rows)
                     self.assertGreater(total, engine.threshold_tokens)
                     self.assertLess(total + 4096, engine.context_length)
-                    fixture.assert_aborted(engine, rows, "capacity")
-                self.assertEqual(engine.compression_count, 0)
-                self.assertEqual((engine.warm_last["path"], engine.warm_last["reason"]), ("aborted", "disabled"))
+                    new = engine.compress(rows)
+                    self.assertIsNot(new, rows)
+                    self.assertGreater(engine.warm_last["over_threshold"], 0)
+                self.assertEqual(engine.compression_count, 1)
+                self.assertEqual((engine.warm_last["path"], engine.warm_last["reason"]), ("fallback", "disabled"))
 
     def test_small_native_replay_without_capture_can_compact(self):
         from warm_compaction.rows import estimate_tokens, sent_rows

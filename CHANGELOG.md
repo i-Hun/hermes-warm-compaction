@@ -29,6 +29,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ### Fixed
 
+- Commit a native replay candidate above the compaction threshold when it fits the context window less the reply reserve and the request overhead. Before, a large system prompt under a low threshold caused `fallback=capacity` and a failed host turn, although the history fits the window. The engine status gets `over_threshold` and the log gets one WARNING. A candidate above the window still fails with `capacity`. A free room below the threshold that cannot hold the summary row structure still stops with `summary_too_large`.
+
 - Report safe fallback reply metadata after success, including success after a retry. Keep the final reply counts, requested limit, attempt count, and end-marker status in the engine log and status. Do not report summary text or the random marker. The requested limit does not prove that the host sent it or that the server applied it.
 - Require at least one verified source-content quote after fallback construction. Use the existing one retry for all-unknown or generated-label-only output, then preserve history if the second reply is also unusable. Keep actual text and argument provenance separate from generated labels. Give a recognized earlier summary core the existing share before its copied appendix uses any remainder; preserve the legacy whole-summary bound for unknown formats.
 - Use the exact bounded focus and memory block sent to the fallback as a separate source block. Keep the existing request reserve and reject an encoded prior quote that also occurs inside an ordinary source line.
